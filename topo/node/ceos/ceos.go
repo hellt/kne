@@ -13,6 +13,7 @@ import (
 	"github.com/google/kne/topo/node"
 	scraplibase "github.com/scrapli/scrapligo/driver/base"
 	scraplicore "github.com/scrapli/scrapligo/driver/core"
+	scraplinetwork "github.com/scrapli/scrapligo/driver/network"
 	scraplitransport "github.com/scrapli/scrapligo/transport"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -34,6 +35,7 @@ func New(pb *topopb.Node) (node.Implementation, error) {
 
 type Node struct {
 	pb *topopb.Node
+	cliConn *scraplinetwork.Driver
 }
 
 func (n *Node) Proto() *topopb.Node {
@@ -51,6 +53,41 @@ func defaultSpawner(command string, timeout time.Duration, opts ...expect.Option
 var (
 	timeSecond = time.Second
 )
+
+func WaitCliReady(d *scraplinetwork.Driver, nn string) error {
+	transportReady := false
+	for !transportReady {
+		if err := d.Open(); err != nil {
+			log.Debugf("%s - Cli not ready - waiting.", nn)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+		transportReady = true
+		log.Debugf("%s - Cli ready.", nn)
+	}
+
+	return nil
+}
+
+func (n *Node) SpawnCliConn(ni node.Interface) error {
+	d, err := scraplicore.NewCoreDriver(
+		n.pb.Name,
+		"arista_eos",
+		scraplibase.WithAuthBypass(true),
+		scraplibase.WithTimeoutOps(time.Second*30),
+	)
+	if err != nil {
+		return err
+	}
+	// set kubectl exec command for scrapli transport
+	transport, _ := d.Transport.(*scraplitransport.System)
+	transport.ExecCmd = "kubectl"
+	transport.OpenCmd = []string{"exec", "-it", "-n", ni.Namespace(), n.pb.Name, "--", "Cli"}
+
+	n.cliConn = d
+
+	return nil
+}
 
 func (n *Node) GenerateSelfSigned(ctx context.Context, ni node.Interface) error {
 	selfSigned := n.pb.GetConfig().GetCert().GetSelfSigned()
@@ -74,39 +111,24 @@ func (n *Node) GenerateSelfSigned(ctx context.Context, ni node.Interface) error 
 	}
 	log.Infof("%s - pod running.", n.pb.Name)
 
-	d, err := scraplicore.NewCoreDriver(
-		n.pb.Name,
-		"arista_eos",
-		scraplibase.WithAuthBypass(true),
-		scraplibase.WithTimeoutOps(time.Second*30),
-	)
+	err = n.SpawnCliConn(ni)
 	if err != nil {
 		return err
 	}
-	// set kubectl exec command for scrapli transport
-	transport, _ := d.Transport.(*scraplitransport.System)
-	transport.ExecCmd = "kubectl"
-	transport.OpenCmd = []string{"exec", "-it", "-n", ni.Namespace(), n.pb.Name, "--", "Cli"}
 
-	transportReady := false
-	for !transportReady {
-		if err := d.Open(); err != nil {
-			log.Debugf("%s - Cli not ready - waiting.", n.pb.Name)
-			time.Sleep(time.Second * 2)
-			continue
-		}
-		transportReady = true
-		log.Debugf("%s - Cli ready, starting certificate provisioning.", n.pb.Name)
+	err = WaitCliReady(n.cliConn, n.pb.Name)
+	if err != nil {
+		return err
 	}
 
-	defer d.Close()
+	defer n.cliConn.Close()
 
 	cmds := []string{
 		fmt.Sprintf("security pki key generate rsa %d %s\n", selfSigned.KeySize, selfSigned.KeyName),
 		fmt.Sprintf("security pki certificate generate self-signed %s key %s parameters common-name %s\n", selfSigned.CertName, selfSigned.KeyName, n.pb.Name),
 	}
 
-	_, err = d.SendCommands(cmds)
+	_, err = n.cliConn.SendCommands(cmds)
 	if err != nil {
 		return err
 	}

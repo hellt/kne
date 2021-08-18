@@ -1,273 +1,105 @@
 package ceos
 
 import (
-	"context"
 	"fmt"
-	"regexp"
-	"testing"
-	"time"
-
-	expect "github.com/google/goexpect"
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
-	"github.com/h-fam/errdiff"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
+	scraplibase "github.com/scrapli/scrapligo/driver/base"
+	scraplicore "github.com/scrapli/scrapligo/driver/core"
+	scraplinetwork "github.com/scrapli/scrapligo/driver/network"
+	scraplitest "github.com/scrapli/scrapligo/util/testhelper"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
-	ktest "k8s.io/client-go/testing"
+	"testing"
+	"time"
 )
 
-type sends struct {
-	req string
-	err error
+type nodeIntf struct {}
+
+func (ni *nodeIntf) KubeClient() kubernetes.Interface {return nil}
+func (ni *nodeIntf) RESTConfig() *rest.Config {return nil}
+func (ni *nodeIntf) Interfaces() map[string]*node.Link {return nil}
+func (ni *nodeIntf) Namespace() string {return "some-namespace"}
+
+type testNode struct {
+	Node
+	pb *topopb.Node
+	cliConn *scraplinetwork.Driver
 }
 
-type expects struct {
-	resp      string
-	respSlice []string
-	err       error
-}
+func (n *testNode) SpawnCliConn(ni node.Interface, t *testing.T) error {
 
-type fakeExpect struct {
-	spawnErr error
-	expects  []expects
-	sends    []sends
-	closeErr error
-}
+	fmt.Printf("n: %+v\n", n)
+	fmt.Printf("n: %+v\n", n.pb.Name)
 
-func fakeSpawner(f *fakeExpect) func(string, time.Duration, ...expect.Option) (expect.Expecter, <-chan error, error) {
-	return func(string, time.Duration, ...expect.Option) (expect.Expecter, <-chan error, error) {
-		if f.spawnErr != nil {
-			return nil, nil, f.spawnErr
-		}
-		return f, nil, nil
+	d, err := scraplicore.NewCoreDriver(
+		n.pb.Name,
+		"arista_eos",
+		scraplibase.WithAuthBypass(true),
+		scraplibase.WithTimeoutOps(time.Second*30),
+		// obv not a great path :) should modify the patched transport to not accept `t` and also to
+		// have options for path or loaded string or something for the actual session data
+		scraplitest.WithPatchedTransport("/Users/carl/dev/github/scrapligo/test_data/driver/network/sendcommand/arista_eos", t),
+	)
+	if err != nil {
+		return err
 	}
+
+	// set kubectl exec command for scrapli transport -- requires embedding System in TestingTransport...
+	transport, _ := d.Transport.(*scraplitest.TestingTransport)
+	transport.ExecCmd = "kubectl"
+	transport.OpenCmd = []string{"exec", "-it", "-n", ni.Namespace(), n.pb.Name, "--", "Cli"}
+
+	n.cliConn = d
+
+	return nil
 }
 
-func (f *fakeExpect) Expect(*regexp.Regexp, time.Duration) (string, []string, error) {
-	if len(f.expects) == 0 {
-		return "", nil, fmt.Errorf("out of expects")
-	}
-	resp := f.expects[0]
-	f.expects = f.expects[1:]
-	return resp.resp, resp.respSlice, resp.err
+func testNew(pb *topopb.Node) (node.Implementation, error) {
+	cfg := defaults(pb)
+	proto.Merge(cfg, pb)
+	node.FixServices(cfg)
+	return &testNode{
+		pb: cfg,
+	}, nil
 }
-
-func (f *fakeExpect) ExpectBatch([]expect.Batcher, time.Duration) ([]expect.BatchRes, error) {
-	return nil, fmt.Errorf("Unimplemented")
-}
-
-func (f *fakeExpect) ExpectSwitchCase([]expect.Caser, time.Duration) (string, []string, int, error) {
-	return "", nil, 0, fmt.Errorf("Unimplemented")
-}
-
-func (f *fakeExpect) Send(string) error {
-	if len(f.sends) == 0 {
-		return fmt.Errorf("out of sends")
-	}
-	resp := f.sends[0]
-	f.sends = f.sends[1:]
-	return resp.err
-}
-
-func (f *fakeExpect) Close() error {
-	return f.closeErr
-}
-
-type fakeNode struct {
-	kClient    kubernetes.Interface
-	namespace  string
-	interfaces map[string]*node.Link
-	rCfg       *rest.Config
-}
-
-func (f *fakeNode) KubeClient() kubernetes.Interface {
-	return f.kClient
-}
-
-func (f *fakeNode) RESTConfig() *rest.Config {
-	return f.rCfg
-}
-
-func (f *fakeNode) Interfaces() map[string]*node.Link {
-	return f.interfaces
-}
-
-func (f *fakeNode) Namespace() string {
-	return f.namespace
-}
-
-type fakeWatch struct {
-	e []watch.Event
-}
-
-func (f *fakeWatch) Stop() {}
-
-func (f *fakeWatch) ResultChan() <-chan watch.Event {
-	eCh := make(chan watch.Event)
-	go func() {
-		for len(f.e) != 0 {
-			e := f.e[0]
-			f.e = f.e[1:]
-			eCh <- e
-		}
-	}()
-	return eCh
-}
-
-var (
-	validPb = &topopb.Node{
-		Name: "pod1",
-		Config: &topopb.Config{
-			Cert: &topopb.CertificateCfg{
-				Config: &topopb.CertificateCfg_SelfSigned{
-					SelfSigned: &topopb.SelfSignedCertCfg{
-						CertName:   "testCert.pem",
-						KeyName:    "testCertKey.pem",
-						KeySize:    4096,
-						CommonName: "r1",
-					},
-				},
-			},
-		},
-	}
-)
 
 func TestGenerateSelfSigned(t *testing.T) {
-	ki := fake.NewSimpleClientset(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "pod1",
-		},
-	})
-	reaction := func(action ktest.Action) (handled bool, ret watch.Interface, err error) {
-		f := &fakeWatch{
-			e: []watch.Event{{
-				Object: &corev1.Pod{
-					Status: corev1.PodStatus{
-						Phase: corev1.PodRunning,
+	bn := &topopb.Node{
+		Name:        "testEosNode",
+		Type:        2,
+		Config:      &topopb.Config{
+			Cert:    &topopb.CertificateCfg{
+				Config: &topopb.CertificateCfg_SelfSigned{
+					SelfSigned: &topopb.SelfSignedCertCfg{
+						CertName: "my_cert",
+						KeyName: "my_key",
+						KeySize: 1024,
 					},
 				},
-			}},
-		}
-		return true, f, nil
+			},
+		},
 	}
-	ki.PrependWatchReactor("*", reaction)
-	tests := []struct {
-		desc    string
-		wantErr string
-		ni      node.Interface
-		pb      *topopb.Node
-		spawner func(string, time.Duration, ...expect.Option) (expect.Expecter, <-chan error, error)
-	}{{
-		desc: "no pb",
-	}, {
-		desc: "valid pb",
-		pb:   validPb,
-		ni: &fakeNode{
-			kClient:   ki,
-			namespace: "test",
-		},
-		spawner: fakeSpawner(&fakeExpect{
-			expects: []expects{
-				{resp: "some stuff>"}, // base
-				{resp: "prompt#"},     // enable
-				{resp: "prompt#"},     // key gen
-				{resp: "prompt#"},     // cert gen
-			},
-			sends: []sends{
-				{err: nil}, // enable
-				{err: nil}, // key gen
-				{err: nil}, // cert gen
-			},
-		}),
-	}, {
-		desc: "retry first prompt",
-		pb:   validPb,
-		ni: &fakeNode{
-			kClient:   ki,
-			namespace: "test",
-		},
-		spawner: fakeSpawner(&fakeExpect{
-			expects: []expects{
-				{err: fmt.Errorf("promptErr")},
-				{resp: "prompt>"}, // base
-				{resp: "prompt#"}, // enable
-				{resp: "prompt#"}, // key gen
-				{resp: "prompt#"}, // cert gen
-			},
-			sends: []sends{
-				{err: nil}, // enable
-				{err: nil}, // key gen
-				{err: nil}, // cert gen
-			},
-		}),
-	}, {
-		desc: "retry enable",
-		pb:   validPb,
-		ni: &fakeNode{
-			kClient:   ki,
-			namespace: "test",
-		},
-		spawner: fakeSpawner(&fakeExpect{
-			expects: []expects{
-				{resp: "some stuff>"},          // base
-				{err: fmt.Errorf("enableErr")}, // enable
-				{resp: "prompt>"},              // base
-				{resp: "prompt#"},              // enable
-				{resp: "prompt#"},              // key gen
-				{resp: "prompt#"},              // cert gen
-			},
-			sends: []sends{
-				{err: nil}, // enable (fail)
-				{err: nil}, // enable
-				{err: nil}, // key gen
-				{err: nil}, // cert gen
-			},
-		}),
-	}, {
-		desc: "close err",
-		pb:   validPb,
-		ni: &fakeNode{
-			kClient:   ki,
-			namespace: "test",
-		},
-		spawner: fakeSpawner(&fakeExpect{
-			expects: []expects{
-				{resp: "prompt>"}, // base
-				{resp: "prompt#"}, // enable
-				{resp: "prompt#"}, // key gen
-				{resp: "prompt#"}, // cert gen
-			},
-			sends: []sends{
-				{err: nil}, // enable
-				{err: nil}, // key gen
-				{err: nil}, // cert gen
-			},
-			closeErr: fmt.Errorf("close err"),
-		}),
-		wantErr: "close err",
-	}}
-	for _, tt := range tests {
-		t.Run(tt.desc, func(t *testing.T) {
-			spawner = tt.spawner
-			timeSecond = 0
-			defer func() {
-				spawner = defaultSpawner
-				timeSecond = time.Second
-			}()
-			nImpl, _ := New(tt.pb)
-			n := nImpl.(*Node)
-			ctx := context.Background()
-			err := n.GenerateSelfSigned(ctx, tt.ni)
-			if s := errdiff.Check(err, tt.wantErr); s != "" {
-				t.Fatalf("GenerateSelfSigned unexpected error: %s", s)
-			}
-			if tt.wantErr != "" {
-				return
-			}
-		})
+
+	n, err := testNew(bn)
+
+	if err != nil {
+		t.Fatalf("failed creating kne arista node")
 	}
+
+	fmt.Printf("N: %+v\n", n)
+
+	typedN, _ := n.(*testNode)
+
+	ni := &nodeIntf{}
+	_ = typedN.SpawnCliConn(ni, t)
+
+	typedTransport, _ := typedN.cliConn.Transport.(*scraplitest.TestingTransport)
+	fmt.Printf("OpenCmd: %+v\n", typedTransport.OpenCmd)
+
+	// obv can assert the open cmd / exec cmd get set correctly
+
+	// in theory once we have pointed the testing transport at legit session data this should
+	// just "work" for testing loading up certs and stuff
 }
