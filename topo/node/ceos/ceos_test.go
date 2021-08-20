@@ -3,6 +3,7 @@ package ceos
 import (
 	"context"
 	"testing"
+	"time"
 
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
@@ -86,7 +87,7 @@ func TestGenerateSelfSigned(t *testing.T) {
 		namespace: "test",
 	}
 
-	bn := &topopb.Node{
+	pb := &topopb.Node{
 		Name: "testEosNode",
 		Type: 2,
 		Config: &topopb.Config{
@@ -102,28 +103,58 @@ func TestGenerateSelfSigned(t *testing.T) {
 		},
 	}
 
-	n, err := New(bn)
-
-	if err != nil {
-		t.Fatalf("failed creating kne arista node")
+	tests := []struct{
+		desc     string
+		wantErr  bool
+		ni       node.Interface
+		pb       *topopb.Node
+		testFile string
+	}{
+		{
+			// successfully configure certificate
+			desc:     "success",
+			wantErr:  false,
+			ni:       ni,
+			pb:       pb,
+			testFile: "generate_certificate_success",
+		},
+		{
+			// device returns "% Invalid Input" -- we expect to fail
+			desc:     "failure",
+			wantErr:  true,
+			ni:       ni,
+			pb:       pb,
+			testFile: "generate_certificate_failure",
+		},
 	}
 
-	nImpl, _ := n.(*Node)
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			n, err := New(pb)
 
-	oldNewCoreDriver := scraplicore.NewCoreDriver
-	defer func() { scraplicore.NewCoreDriver = oldNewCoreDriver }()
-	scraplicore.NewCoreDriver = func(host, platform string, options ...scraplibase.Option) (*scraplinetwork.Driver, error) {
-		return scraplicore.NewEOSDriver(
-			host,
-			scraplibase.WithAuthBypass(true),
-			scraplitest.WithPatchedTransport("generate_certificate_success"),
-		)
-	}
+			if err != nil {
+				t.Fatalf("failed creating kne arista node")
+			}
 
-	ctx := context.Background()
+			nImpl, _ := n.(*Node)
 
-	err = nImpl.GenerateSelfSigned(ctx, ni)
-	if err != nil {
-		t.Fatalf("generating self signed cert failed, error: %+v\n", err)
+			oldNewCoreDriver := scraplicore.NewCoreDriver
+			defer func() { scraplicore.NewCoreDriver = oldNewCoreDriver }()
+			scraplicore.NewCoreDriver = func(host, platform string, options ...scraplibase.Option) (*scraplinetwork.Driver, error) {
+				return scraplicore.NewEOSDriver(
+					host,
+					scraplibase.WithAuthBypass(true),
+					scraplibase.WithTimeoutOps(1 * time.Second),
+					scraplitest.WithPatchedTransport(tt.testFile),
+				)
+			}
+
+			ctx := context.Background()
+
+			err = nImpl.GenerateSelfSigned(ctx, ni)
+			if err != nil && !tt.wantErr {
+				t.Fatalf("generating self signed cert failed, error: %+v\n", err)
+			}
+		})
 	}
 }
