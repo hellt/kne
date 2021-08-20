@@ -8,7 +8,6 @@ require (
 	github.com/docker/go-connections v0.4.0 // indirect
 	github.com/golang/mock v1.6.0
 	github.com/golang/protobuf v1.5.2
-	github.com/google/goexpect v0.0.0-20210430020637-ab937bf7fd6f
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/h-fam/errdiff v1.0.2
 	github.com/kr/pretty v0.2.1
