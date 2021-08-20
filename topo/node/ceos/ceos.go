@@ -7,10 +7,8 @@ import (
 	"io"
 	"io/ioutil"
 	"reflect"
-	"regexp"
 	"time"
 
-	expect "github.com/google/goexpect"
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
 	scraplibase "github.com/scrapli/scrapligo/driver/base"
@@ -49,22 +47,6 @@ func (n *Node) Proto() *topopb.Node {
 	return n.pb
 }
 
-var (
-	spawner = defaultSpawner
-)
-
-func defaultSpawner(
-	command string,
-	timeout time.Duration,
-	opts ...expect.Option,
-) (expect.Expecter, <-chan error, error) {
-	return expect.Spawn(command, timeout, opts...)
-}
-
-var (
-	timeSecond = time.Second
-)
-
 func (n *Node) WaitCliReady() error {
 	transportReady := false
 	for !transportReady {
@@ -80,7 +62,7 @@ func (n *Node) WaitCliReady() error {
 	return nil
 }
 
-func (n *Node) PatchCliConnOpen(ni node.Interface) error {
+func (n *Node) PatchCliConnOpen(ns string) error {
 	tIntf := reflect.ValueOf(n.cliConn.Transport)
 
 	if tIntf.Type().Kind() != reflect.Ptr {
@@ -97,13 +79,13 @@ func (n *Node) PatchCliConnOpen(ni node.Interface) error {
 
 	execCmd.SetString("kubectl")
 	openCmd.Set(
-		reflect.ValueOf([]string{"exec", "-it", "-n", ni.Namespace(), n.pb.Name, "--", "Cli"}),
+		reflect.ValueOf([]string{"exec", "-it", "-n", ns, n.pb.Name, "--", "Cli"}),
 	)
 
 	return nil
 }
 
-func (n *Node) SpawnCliConn(ni node.Interface) error {
+func (n *Node) SpawnCliConn(ns string) error {
 	d, err := scraplicore.NewCoreDriver(
 		n.pb.Name,
 		"arista_eos",
@@ -115,7 +97,7 @@ func (n *Node) SpawnCliConn(ni node.Interface) error {
 
 	n.cliConn = d
 
-	err = n.PatchCliConnOpen(ni)
+	err = n.PatchCliConnOpen(ns)
 	if err != nil {
 		n.cliConn = nil
 
@@ -154,14 +136,14 @@ func (n *Node) GenerateSelfSigned(ctx context.Context, ni node.Interface) error 
 	}
 	log.Infof("%s - pod running.", n.pb.Name)
 
-	err = n.SpawnCliConn(ni)
+	err = n.SpawnCliConn(ni.Namespace())
 	if err != nil {
 		return err
 	}
 
 	defer n.cliConn.Close()
 
-	cmds := []string{
+	cfgs := []string{
 		fmt.Sprintf(
 			"security pki key generate rsa %d %s\n",
 			selfSigned.KeySize,
@@ -175,7 +157,7 @@ func (n *Node) GenerateSelfSigned(ctx context.Context, ni node.Interface) error 
 		),
 	}
 
-	r, err := n.cliConn.SendConfigs(cmds)
+	r, err := n.cliConn.SendConfigs(cfgs)
 	if err != nil {
 		return err
 	} else if r.Failed() {
@@ -188,44 +170,34 @@ func (n *Node) GenerateSelfSigned(ctx context.Context, ni node.Interface) error 
 }
 
 func (n *Node) ConfigPush(ctx context.Context, ns string, r io.Reader) error {
-	log.Infof("Pushing config to %s:%s", ns, n.pb.Name)
-	config, err := ioutil.ReadAll(r)
-	log.Debug(string(config))
+	log.Infof("%s - pushing config", n.pb.Name)
+
+	cfg, err := ioutil.ReadAll(r)
+	cfgs := string(cfg)
+
+	log.Debug(cfgs)
+
 	if err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("kubectl exec -it -n %s %s -- Cli", ns, n.pb.Name)
-	g, _, err := spawner(cmd, -1)
+
+	err = n.SpawnCliConn(ns)
 	if err != nil {
 		return err
 	}
-	_, _, err = g.Expect(regexp.MustCompile(`>`), -1)
+
+	defer n.cliConn.Close()
+
+	resp, err := n.cliConn.SendConfig(cfgs)
 	if err != nil {
 		return err
+	} else if resp.Failed {
+		return ErrCliOperationFailed
 	}
-	if err := g.Send("enable\n"); err != nil {
-		return err
-	}
-	_, _, err = g.Expect(regexp.MustCompile(`#`), -1)
-	if err != nil {
-		return err
-	}
-	if err := g.Send("configure terminal\n"); err != nil {
-		return err
-	}
-	_, _, err = g.Expect(regexp.MustCompile(`\(config\)#`), -1)
-	if err != nil {
-		return err
-	}
-	if err := g.Send(string(config)); err != nil {
-		return err
-	}
-	_, _, err = g.Expect(regexp.MustCompile(`#`), -1)
-	if err != nil {
-		return err
-	}
-	log.Info("Finshed config push")
-	return g.Close()
+
+	log.Infof("%s - finshed config push", n.pb.Name)
+
+	return nil
 }
 
 func (n *Node) CreateNodeResource(_ context.Context, _ node.Interface) error {
