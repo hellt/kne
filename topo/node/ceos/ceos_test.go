@@ -1,105 +1,129 @@
 package ceos
 
 import (
-	"fmt"
+	"context"
+	"testing"
+
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
 	scraplibase "github.com/scrapli/scrapligo/driver/base"
 	scraplicore "github.com/scrapli/scrapligo/driver/core"
 	scraplinetwork "github.com/scrapli/scrapligo/driver/network"
 	scraplitest "github.com/scrapli/scrapligo/util/testhelper"
-	"google.golang.org/protobuf/proto"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
-	"testing"
-	"time"
+	ktest "k8s.io/client-go/testing"
 )
 
-type nodeIntf struct {}
-
-func (ni *nodeIntf) KubeClient() kubernetes.Interface {return nil}
-func (ni *nodeIntf) RESTConfig() *rest.Config {return nil}
-func (ni *nodeIntf) Interfaces() map[string]*node.Link {return nil}
-func (ni *nodeIntf) Namespace() string {return "some-namespace"}
-
-type testNode struct {
-	Node
-	pb *topopb.Node
-	cliConn *scraplinetwork.Driver
+type fakeNode struct {
+	kClient    kubernetes.Interface
+	namespace  string
+	interfaces map[string]*node.Link
+	rCfg       *rest.Config
 }
 
-func (n *testNode) SpawnCliConn(ni node.Interface, t *testing.T) error {
-
-	fmt.Printf("n: %+v\n", n)
-	fmt.Printf("n: %+v\n", n.pb.Name)
-
-	d, err := scraplicore.NewCoreDriver(
-		n.pb.Name,
-		"arista_eos",
-		scraplibase.WithAuthBypass(true),
-		scraplibase.WithTimeoutOps(time.Second*30),
-		// obv not a great path :) should modify the patched transport to not accept `t` and also to
-		// have options for path or loaded string or something for the actual session data
-		scraplitest.WithPatchedTransport("/Users/carl/dev/github/scrapligo/test_data/driver/network/sendcommand/arista_eos", t),
-	)
-	if err != nil {
-		return err
-	}
-
-	// set kubectl exec command for scrapli transport -- requires embedding System in TestingTransport...
-	transport, _ := d.Transport.(*scraplitest.TestingTransport)
-	transport.ExecCmd = "kubectl"
-	transport.OpenCmd = []string{"exec", "-it", "-n", ni.Namespace(), n.pb.Name, "--", "Cli"}
-
-	n.cliConn = d
-
-	return nil
+func (f *fakeNode) KubeClient() kubernetes.Interface {
+	return f.kClient
 }
 
-func testNew(pb *topopb.Node) (node.Implementation, error) {
-	cfg := defaults(pb)
-	proto.Merge(cfg, pb)
-	node.FixServices(cfg)
-	return &testNode{
-		pb: cfg,
-	}, nil
+func (f *fakeNode) RESTConfig() *rest.Config {
+	return f.rCfg
+}
+
+func (f *fakeNode) Interfaces() map[string]*node.Link {
+	return f.interfaces
+}
+
+func (f *fakeNode) Namespace() string {
+	return f.namespace
+}
+
+type fakeWatch struct {
+	e []watch.Event
+}
+
+func (f *fakeWatch) Stop() {}
+
+func (f *fakeWatch) ResultChan() <-chan watch.Event {
+	eCh := make(chan watch.Event)
+	go func() {
+		for len(f.e) != 0 {
+			e := f.e[0]
+			f.e = f.e[1:]
+			eCh <- e
+		}
+	}()
+	return eCh
 }
 
 func TestGenerateSelfSigned(t *testing.T) {
+	ki := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod1",
+		},
+	})
+
+	reaction := func(action ktest.Action) (handled bool, ret watch.Interface, err error) {
+		f := &fakeWatch{
+			e: []watch.Event{{
+				Object: &corev1.Pod{
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+			}},
+		}
+		return true, f, nil
+	}
+	ki.PrependWatchReactor("*", reaction)
+
+	ni := &fakeNode{
+		kClient:   ki,
+		namespace: "test",
+	}
+
 	bn := &topopb.Node{
-		Name:        "testEosNode",
-		Type:        2,
-		Config:      &topopb.Config{
-			Cert:    &topopb.CertificateCfg{
+		Name: "testEosNode",
+		Type: 2,
+		Config: &topopb.Config{
+			Cert: &topopb.CertificateCfg{
 				Config: &topopb.CertificateCfg_SelfSigned{
 					SelfSigned: &topopb.SelfSignedCertCfg{
 						CertName: "my_cert",
-						KeyName: "my_key",
-						KeySize: 1024,
+						KeyName:  "my_key",
+						KeySize:  2048,
 					},
 				},
 			},
 		},
 	}
 
-	n, err := testNew(bn)
+	n, err := New(bn)
 
 	if err != nil {
 		t.Fatalf("failed creating kne arista node")
 	}
 
-	fmt.Printf("N: %+v\n", n)
+	nImpl, _ := n.(*Node)
 
-	typedN, _ := n.(*testNode)
+	oldNewCoreDriver := scraplicore.NewCoreDriver
+	defer func() { scraplicore.NewCoreDriver = oldNewCoreDriver }()
+	scraplicore.NewCoreDriver = func(host, platform string, options ...scraplibase.Option) (*scraplinetwork.Driver, error) {
+		return scraplicore.NewEOSDriver(
+			host,
+			scraplibase.WithAuthBypass(true),
+			scraplitest.WithPatchedTransport("generate_certificate_success"),
+		)
+	}
 
-	ni := &nodeIntf{}
-	_ = typedN.SpawnCliConn(ni, t)
+	ctx := context.Background()
 
-	typedTransport, _ := typedN.cliConn.Transport.(*scraplitest.TestingTransport)
-	fmt.Printf("OpenCmd: %+v\n", typedTransport.OpenCmd)
-
-	// obv can assert the open cmd / exec cmd get set correctly
-
-	// in theory once we have pointed the testing transport at legit session data this should
-	// just "work" for testing loading up certs and stuff
+	err = nImpl.GenerateSelfSigned(ctx, ni)
+	if err != nil {
+		t.Fatalf("generating self signed cert failed, error: %+v\n", err)
+	}
 }
