@@ -199,8 +199,8 @@ func TestResetCfg(t *testing.T) {
 	}
 
 	validPb := &topopb.Node{
-		Name: "pod1",
-		Type: 2,
+		Name:   "pod1",
+		Type:   2,
 		Config: &topopb.Config{},
 	}
 

@@ -17,10 +17,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	scraplitest "github.com/scrapli/scrapligo/util/testhelper"
 	"io"
 	"io/ioutil"
 	"time"
+
+	scraplitest "github.com/scrapli/scrapligo/util/testhelper"
 
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
@@ -224,7 +225,10 @@ func (n *Node) ResetCfg(ctx context.Context, ni node.Interface) error {
 	defer n.cliConn.Close()
 
 	// this takes a long time sometimes, so we crank timeouts up
-	resp, err := n.cliConn.SendCommand("configure replace clean-config", scraplibase.WithSendTimeoutOps(300 * time.Second))
+	resp, err := n.cliConn.SendCommand(
+		"configure replace clean-config",
+		scraplibase.WithSendTimeoutOps(300*time.Second),
+	)
 	if err != nil {
 		return err
 	} else if resp.Failed {
